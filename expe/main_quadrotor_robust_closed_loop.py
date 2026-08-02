@@ -10,9 +10,9 @@ from matplotlib.patches import Polygon
 import matplotlib.colors as mcolors
 import argparse
 
-# Output folder
-folder_name = "quadrotor_robust_closed_loop"
-os.makedirs(folder_name, exist_ok=True)
+from util.paths import results_dir
+
+_RESULT_NAME = "quadrotor_robust_closed_loop"
 
 # Prefer the JIT solver (with warm-start support)
 from solver.SCP_SLS_jit import SCP_SLS as SCP_SLS_impl
@@ -28,12 +28,9 @@ def _tube_halfwidth_to_unit(halfw, lb, ub):
     return 2.0 * halfw / denom
 
 
-# fix the random seed for reproducibility
-np.random.seed(0)
-
-
-def generate(N: int | None = None):
+def generate(N: int | None = None, smoke_test: bool = False):
     m = Quadrotor()
+    folder_name = str(results_dir(_RESULT_NAME))
 
     # Costs
     Q = np.diag([
@@ -45,7 +42,7 @@ def generate(N: int | None = None):
     R = np.diag([1.0, 1.0, 1.0, 1.0])
     Qf = 10 * Q
 
-    N = int(N) if N is not None else 15  # horizon length
+    N = 3 if smoke_test else (int(N) if N is not None else 15)  # horizon length
     m.dt = 0.05
 
     # Process noise scaling (conservative)
@@ -59,13 +56,15 @@ def generate(N: int | None = None):
         0.2, 0.2, 0.2      # omega [rad/s]
     ])
 
+    rti = 1 if smoke_test else 3
+    fast_sls_rti_steps = 1 if smoke_test else 2
     solver = SCP_SLS_impl(
         N, Q, R, m, Qf,
         Q_reg=1e4 * np.eye(m.nx),
         R_reg=1e4 * np.eye(m.nu),
         Q_reg_f=1e4 * np.eye(m.nx),
-        rti=3,
-        fast_sls_rti_steps=2,
+        rti=rti,
+        fast_sls_rti_steps=fast_sls_rti_steps,
     )
     solver.fast_SLS_solver.solver_forward.export_standard_qp = False
     solver.verbose = True
@@ -79,7 +78,7 @@ def generate(N: int | None = None):
     lb_x = -m.g[m.nx + m.nu: m.nx + m.nu + m.nx]
 
     # initial condition: random within half-range, with unit quaternion
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(0)  # seeded for reproducibility
     x0 = rng.uniform(lb_x / 2, ub_x / 2)
     q_rand = rng.normal(size=4)
     nrm = np.linalg.norm(q_rand)
@@ -89,7 +88,7 @@ def generate(N: int | None = None):
         q_rand = q_rand / nrm
     x0[6:10] = q_rand  # [qw,qx,qy,qz]
 
-    simulation_time_steps = 30
+    simulation_time_steps = 3 if smoke_test else 30
 
     # Allocate logs
     state_trajectory = np.zeros((m.nx, simulation_time_steps))
@@ -129,8 +128,8 @@ def generate(N: int | None = None):
         if i < simulation_time_steps - 1:
             input_trajectory[:, i] = solution['primal_u'][:, 0]
 
-        # propagate without noise
-        x0 = m.ddyn(x0, solution['primal_u'][:, 0])
+        w = rng.uniform(-1.0, 1.0, size=m.nx)  # seeded disturbance realization
+        x0 = m.ddyn(x0, solution['primal_u'][:, 0]) + m.E @ w
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     filename = os.path.join(folder_name, f"quadrotor_robust_closed_loop_{timestamp}.npz")
@@ -156,9 +155,11 @@ def generate(N: int | None = None):
     )
 
     print(f"Results saved to {filename}")
+    return filename
 
 
 def plot():
+    folder_name = str(results_dir(_RESULT_NAME))
     files = [f for f in os.listdir(folder_name) if f.endswith('.npz')]
     if not files:
         print("No data files found in the directory.")
@@ -380,10 +381,12 @@ def plot():
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Quadrotor robust closed-loop experiment")
     parser.add_argument('--run', action='store_true', help='Run the closed-loop simulation (generate data)')
-    parser.add_argument('--N', type=int, default=15, help='Horizon length (overrides default if provided)')
+    parser.add_argument('--N', type=int, default=None, help='Horizon length (overrides default if provided)')
+    parser.add_argument('--smoke-test', action='store_true',
+                        help='Run a short, cheap variant to validate the pipeline end-to-end.')
     args = parser.parse_args()
 
     if args.run:
-        generate(args.N)
+        generate(args.N, smoke_test=args.smoke_test)
     else:
         plot()

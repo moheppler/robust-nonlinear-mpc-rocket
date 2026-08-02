@@ -7,7 +7,6 @@ import matplotlib.pyplot as plt
 import os
 from datetime import datetime
 import time
-from util.quaternion_to_euler import quaternion_to_euler
 
 
 class Rocket(Model):

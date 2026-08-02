@@ -7,7 +7,6 @@ from solver.fast_SLS_jit import fast_SLS
 from solver.nlp import NLP
 
 from prettytable import PrettyTable, NONE, HEADER
-from util.SLS import SLS
 from scipy.sparse import csc_matrix
 from scipy.linalg import solve_discrete_are  # added for LQR computation
 import time
@@ -59,7 +58,6 @@ class SCP_SLS(OCP):
 
         self.fast_SLS_solver = None
         self.initialize_fast_SLS_solver()
-        self.fast_SLS_solver.verbose = False
         self.fast_SLS_solver.save_it_data = False
 
     def solve(self, x0):
@@ -67,9 +65,6 @@ class SCP_SLS(OCP):
         Implementation of an SCP algorithm. Each iteration of the SCP consists of the fast-SLS algorithm.
         This algorithm is an implementation of the Algorithm 2 in the paper: https://arxiv.org/pdf/2005.13297.pdf
         """
-        table = None
-        if self.verbose:
-            table = self.printHeader()
         # nominal trajectory initialization (only if none exists yet, e.g., after warm start we skip)
         has_nominal = ('primal_x' in self.current_iteration_scp) and ('primal_u' in self.current_iteration_scp)
         if not has_nominal:
@@ -109,10 +104,23 @@ class SCP_SLS(OCP):
             max_iters = int(self.MAX_ITER_SCP)
             run_until_converged = True  # -1 => until convergence (safety cap still applies)
 
+        # Print the (merged SCP+SLS) table header here, after solve_nominal_trajectory()'s own
+        # message above, not before it -- keeps the header immediately followed by real rows
+        # instead of an unrelated message sitting between them.
+        table = None
+        if self.verbose:
+            table = self.printHeader()
+
         last_iter = 0
         last_success = False
         for ii in range(max_iters):
             last_iter = ii
+            # Hand this iteration's rows off into the shared table: fast_SLS.printHeader/
+            # printLine append into it (SLS columns filled, SCP columns blank) instead of
+            # printing their own separate, differently-indented table.
+            if self.verbose and table is not None:
+                self.fast_SLS_solver._external_table = table
+                self.fast_SLS_solver._external_group_label = ii
             # solve fast-SLS algorithm
             step_ok = self.socp_step(x0)
             last_success = bool(step_ok)
@@ -554,32 +562,19 @@ class SCP_SLS(OCP):
     @staticmethod
     def printHeader():
         fixed_width = 10
-        # Format headers to have fixed width and right alignment
-        headers = ["it (SCP)", "∆ primal", "∆ dual", "∆ cost", "cost nom.", "p. infeas.", "SOCP it"]
+        headers = [
+            "SCP it", "SLS it", "SLS primal", "SLS dual", "SLS cost nom.",
+            "SLS cost tube", "SLS cost", "SCP dx", "SCP dlam", "SCP cost", "SCP infeas",
+        ]
         formatted_headers = [f"{h:>{fixed_width}}" for h in headers]
         table = PrettyTable()
         table.field_names = formatted_headers
         table.hrules = HEADER  # Horizontal line after header
         table.border = True
 
-        # Align columns
-        table.align["it"] = "right"
-        table.align["primal"] = "right"
-        table.align["dual"] = "right"
-        table.align["cost"] = "right"
-        table.align["cost nom."] = "right"
-        table.align["p. infeas."] = "right"
-        table.align["SOCP it"] = "right"
-        # Set a fixed width for all columns
-        fixed_width = 10
-        # Set fixed widths for each column individually
-        table.max_width["it"] = fixed_width
-        table.max_width["primal"] = fixed_width
-        table.max_width["dual"] = fixed_width
-        table.max_width["cost"] = fixed_width
-        table.max_width["cost nom."] = fixed_width
-        table.max_width["p. infeas."] = fixed_width
-        table.max_width["SOCP it"] = fixed_width
+        for h in headers:
+            table.align[h] = "right"
+            table.max_width[h] = fixed_width
 
         print(table.get_string(end=0))
         table.hrules = NONE
@@ -587,24 +582,23 @@ class SCP_SLS(OCP):
         return table
 
     def printLine(self, i, table):
-
         fixed_width = 10
-        primal = np.max(self.current_iteration_scp['delta_vec'])
-        dual = np.max(self.current_iteration_scp['delta_dual_vec'])
-        cost_QP = self.current_iteration_scp['cost_QP']
+        dx = np.max(self.current_iteration_scp['delta_vec'])
+        dlam = np.max(self.current_iteration_scp['delta_dual_vec'])
         cost = self.current_iteration_scp['cost']
         primal_infeasibility = self.current_iteration_scp['primal_infeasibility']
-        socp_steps_number = self.current_iteration_scp['SOCP_steps']
 
-        iteration_str = f"{i:>{fixed_width}}"
-        primal_val = f"{float(primal):>{fixed_width}.2e}"
-        dual_val = f"{float(dual):>{fixed_width}.2e}"
-        cost_QP_val = f"{float(cost_QP):>{fixed_width}.2e}"
-        cost = f"{float(cost):>{fixed_width}.2e}"
-        primal_infeasibility = f"{float(primal_infeasibility):>{fixed_width}.2e}"
-        socp_steps_number = f"{socp_steps_number:>{fixed_width}}"
-
-        table.add_row([iteration_str, primal_val, dual_val, cost_QP_val, cost, primal_infeasibility, socp_steps_number])
+        dash = f"{'-':>{fixed_width}}"
+        row = [
+            f"{i:>{fixed_width}}",
+            f"{'->':>{fixed_width}}",
+            dash, dash, dash, dash, dash,
+            f"{float(dx):>{fixed_width}.2e}",
+            f"{float(dlam):>{fixed_width}.2e}",
+            f"{float(np.asarray(cost).item()):>{fixed_width}.2e}",
+            f"{float(primal_infeasibility):>{fixed_width}.2e}",
+        ]
+        table.add_row(row)
         print(table.get_string(start=len(table._rows) - 1, end=len(table._rows), header=False))
 
     def check_convergence_scp(self):

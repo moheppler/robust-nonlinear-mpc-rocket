@@ -1,4 +1,4 @@
-from dyn.rockETH.rocket import Rocket
+from dyn.rocket import Rocket
 from solver.SCP_SLS_jit import SCP_SLS as SCP_SLS_impl
 from solver.nlp_soft_constraints import NLPSoftConstraints
 
@@ -8,9 +8,9 @@ import os
 from datetime import datetime
 from itertools import cycle
 from matplotlib.lines import Line2D
+from util.paths import results_dir
 
-folder_name = "rockETH_robust_vs_soft_closed_loop"
-os.makedirs(folder_name, exist_ok=True)
+_RESULT_NAME = "rockETH_robust_vs_soft_closed_loop"
 
 
 def _affine_to_unit(x, lb, ub):
@@ -222,11 +222,12 @@ def _run_soft(N, Q, R, Qf, dt, x0, W):
     )
 
 
-def generate():
+def generate(N: int | None = None, smoke_test: bool = False):
+    folder_name = str(results_dir(_RESULT_NAME))
     # Common setup
-    N = 15
+    N = 3 if smoke_test else (int(N) if N is not None else 15)
     dt = 0.05
-    T = 30
+    T = 3 if smoke_test else 30
     Q, R, Qf = _cost_matrices()
 
     # Identical initial condition
@@ -286,10 +287,12 @@ def generate():
     )
 
     print(f"Saved comparison results to {filename}")
+    return filename
 
 
 def plot():
     # Load latest comparison file and overlay closed-loop trajectories
+    folder_name = str(results_dir(_RESULT_NAME))
     files = [f for f in os.listdir(folder_name) if f.endswith('.npz')]
     if not files:
         print("No data files found in the directory.")
@@ -408,6 +411,7 @@ def plot():
 
 def plot_vel_omega_inputs():
     """Plot velocity (v) and angular velocity (omega) for robust vs soft, with compact dual legends."""
+    folder_name = str(results_dir(_RESULT_NAME))
     files = [f for f in os.listdir(folder_name) if f.endswith('.npz')]
     if not files:
         print("No data files found in the directory.")
@@ -488,8 +492,15 @@ def plot_vel_omega_inputs():
 
 
 if __name__ == '__main__':
-    optimize = False  # set True to run both controllers and save results
-    if optimize:
-        generate()
-    # plot()
-    plot_vel_omega_inputs()
+    import argparse
+    parser = argparse.ArgumentParser(description="Rocket robust-vs-soft comparison experiment")
+    parser.add_argument('--run', action='store_true', help='Run both controllers and save results')
+    parser.add_argument('--N', type=int, default=None, help='Horizon length (overrides default if provided)')
+    parser.add_argument('--smoke-test', action='store_true',
+                        help='Run a short, cheap variant to validate the pipeline end-to-end.')
+    args = parser.parse_args()
+
+    if args.run:
+        generate(N=args.N, smoke_test=args.smoke_test)
+    else:
+        plot()

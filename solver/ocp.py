@@ -1,8 +1,6 @@
 import numpy as np
 from dyn.LTI import LTI
 from dyn.LTV import LTV
-from dyn.LTI_OF import LTI_OF
-from dyn.LTV_OF import LTV_OF
 
 class OCP:
     def __init__(self, N, Q, R, m, Qf, Q_reg=None, R_reg=None, Q_reg_f=None):

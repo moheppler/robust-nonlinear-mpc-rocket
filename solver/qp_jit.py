@@ -3,7 +3,9 @@ import casadi as ca
 import scipy.sparse as sp
 from scipy.io import savemat
 from pathlib import Path
+import os
 import shutil
+import stat
 import time
 
 from solver.ocp import OCP
@@ -19,6 +21,13 @@ except Exception:
 EPSILON = 1e-10
 
 
+def _clear_readonly_and_retry(func, path, exc_info):
+    """shutil.rmtree onerror hook: git marks pack files read-only, which Windows'
+    os.unlink refuses to delete (unlike POSIX). Clear the attribute and retry."""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
 class QP(OCP):
     """
     Minimal, fast QP front-end for fast-SLS with three interchangeable backends:
@@ -30,13 +39,30 @@ class QP(OCP):
       - build once; then only q (linear term), l/u (bounds), and numeric A/P update per iteration
       - expose: solve(x0), update_dynamics(...), update_ubg(...), reset_ubg(),
                 update_q_cost_lin(...), add_q_cost_lin(...), reset_q_cost_lin()
+
+    backend="osqp_codegen" caveat: the compiled extension's module-level API
+    (osqp_generated) is a process-wide singleton -- one shared C solver state, not one
+    per QP instance. P is pushed once at construction (Q/R/Qf never change for the
+    instance's life); A is pushed once at construction and again whenever
+    update_dynamics() changes it. Only one such instance may be actively solved at a
+    time without an intervening update_dynamics() call -- constructing or updating a
+    second backend="osqp_codegen" instance in the same process silently makes the first
+    one's next solve() use the second instance's A/P instead of its own.
     """
+
+    # backend="osqp_codegen" is a process-wide singleton (see docstring above) -- track
+    # which QP instance most recently pushed A/P to a given compiled module, so solve()
+    # can detect and refuse to silently solve with another instance's stale data.
+    _codegen_instance_counter = 0
+    _codegen_singleton_owner: dict = {}
 
     def __init__(self, N, Q, R, m, Qf, *, backend="casadi_osqp", codegen_module=None, verbose=True,
                  export_standard_QP: bool = False, export_dir: str | Path | None = None):
         super().__init__(N, Q, R, m, Qf)
         assert backend in {"casadi_osqp", "osqp", "osqp_codegen"}
         self.backend = backend
+        QP._codegen_instance_counter += 1
+        self._instance_id = QP._codegen_instance_counter
         self.codegen_module = codegen_module
         self.verbose = verbose
 
@@ -138,6 +164,13 @@ class QP(OCP):
         self.A_mat_csc.sort_indices()
         self.P_mat_csc.sort_indices()
 
+        # Q/R/Qf never change after construction, so P never changes either -- freeze its
+        # upper-triangular data once, here. Nothing downstream may reassign self.P_mat_csc,
+        # self.P_mat_cas, or recompute self._Px_buf; see _reassemble_numeric_same_sparsity.
+        P_ut0 = sp.triu(2 * self.P_mat_csc, format='csc')
+        P_ut0.sort_indices()
+        self._Px_buf = np.ascontiguousarray(P_ut0.data, dtype=np.float64)
+
         # bounds lbg/ubg
         if isinstance(self.m, LTI):
             ub = ca.kron(ca.DM.ones(N, 1), ca.vertcat(ca.DM.zeros(nx, 1), self.m.g))
@@ -170,6 +203,8 @@ class QP(OCP):
         )
 
         self.reset_q_cost_lin()
+        self._compute_A_update_indices()
+        self._qv_buf = np.zeros((nx + nu) * N + nx, dtype=np.float64)
 
         # fingerprints to ensure sparsity unchanged when updating numerics
         self._A_sig = (tuple(self.A_mat_csc.indices), tuple(self.A_mat_csc.indptr))
@@ -185,48 +220,65 @@ class QP(OCP):
         self.A_mat_csc_osqp = sp.vstack([self.A_mat_csc, I0], format='csc')
         self.A_mat_csc_osqp.sort_indices()
 
-        # base l/u without x0 values yet (filled per-solve)
-        self.lbg_osqp_base = np.concatenate([np.array(self.lbg).astype(float).ravel(),
-                                             np.zeros(nx)])
-        self.ubg_osqp_base = np.concatenate([np.array(self.ubg).astype(float).ravel(),
-                                             np.zeros(nx)])
+        # base l/u without x0 values yet (filled per-solve). Preallocated once here at the
+        # fixed final size (A_mat_csc_osqp's row count). Every writer of these buffers
+        # (_reassemble_numeric_same_sparsity below, and update_ubg/reset_ubg/reset_lbg)
+        # writes in place via slice-assignment -- none of them reassign the buffer object,
+        # so it stays the same persistent array for the object's whole lifetime.
+        self.lbg_osqp_base = np.zeros(self.A_mat_csc_osqp.shape[0], dtype=np.float64)
+        lbg_flat = np.array(self.lbg).astype(float).ravel()
+        self.lbg_osqp_base[:lbg_flat.size] = lbg_flat
+        self.ubg_osqp_base = np.zeros(self.A_mat_csc_osqp.shape[0], dtype=np.float64)
+        ubg_flat = np.array(self.ubg).astype(float).ravel()
+        self.ubg_osqp_base[:ubg_flat.size] = ubg_flat
 
-    def _reassemble_numeric_same_sparsity(self):
-        """Recompute numeric values of A and P given current lists; allow arbitrary (full) matrices.
-        This rebuilds the constraint matrix and cost blocks from scratch and refreshes OSQP buffers.
+        self._l_buf = np.zeros(self.A_mat_csc_osqp.shape[0], dtype=np.float64)
+        self._u_buf = np.zeros(self.A_mat_csc_osqp.shape[0], dtype=np.float64)
+
+    def _compute_A_update_indices(self):
+        """One-time setup: precompute, for each SCP step k, exactly where Ak's and Bk's
+        row-major-flattened values land in the frozen self.A_mat_csc.data array. Lets
+        _reassemble_numeric_same_sparsity() write new dynamics values via plain numpy
+        scatter-writes instead of rebuilding the whole sparse matrix from scratch.
+
+        Standard "tagged permutation" trick: build the identical (row, col) structure with
+        placeholder values 0..nnz-1 in the exact same insertion order _assemble_structures
+        uses, sort it the same way scipy sorts the real matrix, and read off where each
+        placeholder landed. Because scipy's CSC sort_indices() ordering depends only on
+        (row, col) pairs -- never on the data values -- the real matrix (built from the same
+        (row, col) pairs) is guaranteed to land in the identical relative order.
         """
         nx, nu, ni, ni_f, N = self.m.nx, self.m.nu, self.m.ni, self.m.ni_f, self.N
 
-        rows = []
-        cols = []
-        data = []
+        rows, cols, tags = [], [], []
+        a_ranges = []
+        b_ranges = []
 
         def put(r0, c0, M):
             C = sp.coo_matrix(np.asarray(M))
+            n = len(C.data)
             rows.extend(r0 + C.row)
             cols.extend(c0 + C.col)
-            data.extend(C.data)
+            tags.extend(range(len(tags), len(tags) + n))
 
-        def put_dense_block(r0, c0, M):
-            """Insert a dense block M (including explicit zeros) to freeze sparsity pattern."""
-            M = np.asarray(M, dtype=float)
-            nr, nc = M.shape
-            rr = r0 + np.repeat(np.arange(nr), nc)
-            cc = c0 + np.tile(np.arange(nc), nr)
-            rows.extend(rr)
-            cols.extend(cc)
-            data.extend(M.reshape(-1))
+        def put_dense_block(r0, c0, shape):
+            nr, nc = shape
+            n = nr * nc
+            rows.extend(r0 + np.repeat(np.arange(nr), nc))
+            cols.extend(c0 + np.tile(np.arange(nc), nr))
+            start = len(tags)
+            tags.extend(range(start, start + n))
+            return start, start + n
 
         r = 0
         for k in range(N):
-            Ak = np.asarray(self.A_list[k], dtype=float)
-            Bk = np.asarray(self.B_list[k], dtype=float)
             cx = k * (nx + nu)
             cu = cx + nx
             cxp = (k + 1) * (nx + nu)
-            # Use dense placement to keep pattern fixed
-            put_dense_block(r, cx, Ak)
-            put_dense_block(r, cu, Bk)
+            a_start, a_end = put_dense_block(r, cx, (nx, nx))
+            b_start, b_end = put_dense_block(r, cu, (nx, nu))
+            a_ranges.append((a_start, a_end))
+            b_ranges.append((b_start, b_end))
             put(r, cxp, -np.eye(nx))
             r += nx
             G = self.m.G
@@ -236,39 +288,56 @@ class QP(OCP):
         put(r, N * (nx + nu), self.m.Gf)
         r += ni_f
 
-        A_new = sp.csc_matrix((data, (rows, cols)), shape=(r, (nx + nu) * N + nx))
-        A_new.sort_indices()
-        self.A_mat_csc = A_new
-        self.A_mat_cas = ca.DM(A_new)
+        nnz = len(tags)
+        tagged = sp.csc_matrix((tags, (rows, cols)), shape=(r, (nx + nu) * N + nx))
+        tagged.sort_indices()
 
-        # OSQP variant (with extra x0 rows)
+        # inv_perm[original_flat_index] = position in the sorted CSC data array
+        inv_perm = np.empty(nnz, dtype=np.int64)
+        inv_perm[np.asarray(tagged.data, dtype=np.int64)] = np.arange(nnz)
+
+        self._A_update_idx = [
+            (inv_perm[a0:a1], inv_perm[b0:b1])
+            for (a0, a1), (b0, b1) in zip(a_ranges, b_ranges)
+        ]
+
+    def _reassemble_numeric_same_sparsity(self):
+        """Recompute numeric values of A given the current A_list/B_list. P is invariant and
+        never rebuilt here -- see _assemble_structures/_init_backend. Uses the CSC
+        scatter-index map computed once at setup (self._A_update_idx) to write new Ak/Bk
+        values directly into self.A_mat_csc.data, instead of rebuilding the sparse matrix
+        from scratch on every SCP iteration.
+        """
+        N = self.N
+        for k in range(N):
+            idx_A, idx_B = self._A_update_idx[k]
+            self.A_mat_csc.data[idx_A] = np.asarray(self.A_list[k], dtype=float).ravel()
+            self.A_mat_csc.data[idx_B] = np.asarray(self.B_list[k], dtype=float).ravel()
+
+        if self.backend == "casadi_osqp":
+            self.A_mat_cas = ca.DM(self.A_mat_csc)
+
+        # OSQP variant (with extra x0 rows) -- cheap vstack of two already-built CSC
+        # matrices (no Python-level rebuild of the much larger dynamics block).
+        nx = self.m.nx
         nv = self.A_mat_csc.shape[1]
-        I0 = sp.hstack([sp.eye(self.m.nx, format='csc'),
-                        sp.csc_matrix((self.m.nx, nv - self.m.nx))], format='csc')
+        I0 = sp.hstack([sp.eye(nx, format='csc'),
+                        sp.csc_matrix((nx, nv - nx))], format='csc')
         self.A_mat_csc_osqp = sp.vstack([self.A_mat_csc, I0], format='csc')
         self.A_mat_csc_osqp.sort_indices()
 
         # refresh OSQP base bounds for extra rows
-        self.lbg_osqp_base = np.concatenate([np.array(self.lbg).astype(float).ravel(),
-                                             np.zeros(self.m.nx)])
-        self.ubg_osqp_base = np.concatenate([np.array(self.ubg).astype(float).ravel(),
-                                             np.zeros(self.m.nx)])
+        lbg_flat = np.asarray(self.lbg, dtype=np.float64).ravel()
+        self.lbg_osqp_base[:lbg_flat.size] = lbg_flat
+        ubg_flat = np.asarray(self.ubg, dtype=np.float64).ravel()
+        self.ubg_osqp_base[:ubg_flat.size] = ubg_flat
 
-        # Rebuild cost (P) unconditionally (sizes unchanged)
-        Qs = sp.csc_matrix(self.Q)
-        Rs = sp.csc_matrix(self.R)
-        Qf = sp.csc_matrix(self.Qf)
-        QR = sp.bmat([[Qs, None], [None, Rs]], format='csc')
-        P_new = sp.block_diag([QR for _ in range(N)] + [Qf], format='csc')
-        P_new.sort_indices()
-        self.P_mat_csc = P_new
-        self.P_mat_cas = ca.DM(P_new)
-        self.P_mat_csc.sort_indices()
-
-        # ubg:
+        # ubg: stage constraints from self.g_list; terminal from the model's per-stage g_list
+        # (set by SCP/fast-SLS tightening) when present, else the plain-LTI terminal self.g_list[-1].
         pieces = [ca.vertcat(ca.DM.zeros(nx, 1), g) for g in self.g_list[:-1]]
         ub = ca.vertcat(*pieces)
-        ub = ca.vertcat(ub, self.m.g_list[-1])
+        term = self.m.g_list[-1] if getattr(self.m, "g_list", None) is not None else self.g_list[-1]
+        ub = ca.vertcat(ub, term)
         self.update_ubg(ub)
         self.reset_lbg()
 
@@ -331,8 +400,35 @@ class QP(OCP):
                     polishing=True, warm_starting=False, verbose=False
                 )
             else:
-                # Module-level API (functions like update_data_mat/update_data_vec/solve)
+                # Module-level API (functions like update_data_mat/update_data_vec/solve).
+                # This is a process-wide singleton -- the SAME compiled C solver state is
+                # shared by every QP instance in this process, not one per instance. Two
+                # things must be pushed here, once, so a freshly constructed instance is
+                # immediately self-consistent even if solve() is called before its first
+                # update_dynamics() (which is exactly what several tests do, and which
+                # otherwise leaves this instance solving with A/P left over from whatever
+                # QP instance touched the singleton last):
+                #  - P: solver/build_fast.py codegens this extension using a generic
+                #    placeholder Q/Qf, not necessarily THIS instance's actual Q/R/Qf, so the
+                #    codegen-time-baked-in P can be numerically wrong for this instance.
+                #  - A: correct as of construction (self.A_mat_csc_osqp is freshly built in
+                #    _assemble_structures, just before this runs), but never implicitly
+                #    correct on the compiled side until pushed.
+                # P never changes again after this (Q/R/Qf are fixed for the instance's
+                # life), so this is the only place P is ever pushed. A gets pushed again
+                # whenever update_dynamics() actually changes it.
                 self._osqp_prob = mod
+                Ax0 = np.ascontiguousarray(self.A_mat_csc_osqp.data, dtype=np.float64)
+                pushed = mod.update_data_mat(P_x=self._Px_buf, A_x=Ax0)
+                if pushed != 0:
+                    raise RuntimeError(
+                        f"Initial update_data_mat(P_x=..., A_x=...) failed with code {pushed}. "
+                        "This means the compiled solver in build/osqp_fast was codegen'd for a "
+                        "different horizon N (or different dynamics/constraints) than the one "
+                        "you're running now. Rebuild it to match: "
+                        "`rnmpc build-fast <system> --N <k>`."
+                    )
+                QP._codegen_singleton_owner[self.codegen_module] = self._instance_id
 
         else:
             raise ValueError(f"Unknown backend {self.backend}")
@@ -405,48 +501,47 @@ class QP(OCP):
             cg = self._osqp_prob
             nx = self.m.nx
 
-            # ---- vectors (with x0 box in last nx rows) ----
-            qv = np.ascontiguousarray(np.array(self.q_cost_lin, dtype=np.float64).ravel())
-            l_curr = np.array(self.lbg, dtype=float).ravel()
-            u_curr = np.array(self.ubg, dtype=float).ravel()
-            l = np.ascontiguousarray(np.concatenate([l_curr, np.zeros(nx)]), dtype=np.float64)
-            u = np.ascontiguousarray(np.concatenate([u_curr, np.zeros(nx)]), dtype=np.float64)
+            # ---- vectors (with x0 box in last nx rows), written into persistent buffers ----
+            self._qv_buf[:] = np.asarray(self.q_cost_lin, dtype=np.float64).ravel()
+
+            l_curr = np.asarray(self.lbg, dtype=np.float64).ravel()
+            u_curr = np.asarray(self.ubg, dtype=np.float64).ravel()
+            self._l_buf[:l_curr.size] = l_curr
+            self._u_buf[:u_curr.size] = u_curr
 
             x0v = np.asarray(x0, dtype=np.float64).ravel()
             # Enforce x(0) + x0 = 0  => A*y = -x0
-            l[-nx:] = -x0v - EPSILON
-            u[-nx:] = -x0v + EPSILON
+            self._l_buf[-nx:] = -x0v - EPSILON
+            self._u_buf[-nx:] = -x0v + EPSILON
 
             BIG = 1e20
-            l[np.isneginf(l)] = -BIG
-            l[np.isposinf(l)] = BIG
-            u[np.isposinf(u)] = BIG
-            u[np.isneginf(u)] = -BIG
-
-            # ---- matrices: must match codegen CSC pattern and order ----
-            P_ut = sp.triu(2 * self.P_mat_csc, format='csc')
-            P_ut.sort_indices()
-            A_osqp = self.A_mat_csc_osqp
-            A_osqp.sort_indices()
-
-            # Verify CSC pattern and ordering are identical to codegen setup
-            if hasattr(self, "_P_cg_sig") and hasattr(self, "_A_cg_sig"):
-                self._assert_same_csc_pattern(P_ut, self._P_cg_sig, "P_ut")
-                self._assert_same_csc_pattern(A_osqp, self._A_cg_sig, "A_osqp")
-
-            # Take data arrays in the exact frozen order
-            Px = np.ascontiguousarray(P_ut.data.astype(np.float64))
-            Ax = np.ascontiguousarray(A_osqp.data.astype(np.float64))
+            self._l_buf[np.isneginf(self._l_buf)] = -BIG
+            self._l_buf[np.isposinf(self._l_buf)] = BIG
+            self._u_buf[np.isposinf(self._u_buf)] = BIG
+            self._u_buf[np.isneginf(self._u_buf)] = -BIG
 
             # ---- sanity sizes ----
-            n = P_ut.shape[0]
-            m = A_osqp.shape[0]
-            assert qv.size == n and l.size == m and u.size == m
-            assert Px.size == P_ut.nnz
-            assert Ax.size == A_osqp.nnz
+            assert self._qv_buf.size == self.P_mat_csc.shape[0]
+            assert self._l_buf.size == self.A_mat_csc_osqp.shape[0]
+            assert self._u_buf.size == self.A_mat_csc_osqp.shape[0]
 
-            # ---- push numerics ----
-            self._cg_push_updates(cg, Px, Ax, qv, l, u)
+            # ---- push numerics: q/l/u only. A was already pushed in update_dynamics() (it
+            # doesn't change between fast-SLS/RTI inner iterations); P was pushed once at
+            # setup (_init_backend) since Q/R/Qf never change. ----
+            self._cg_push_updates(cg, self._qv_buf, self._l_buf, self._u_buf)
+
+            # ---- guard the process-wide singleton: refuse to solve with another QP
+            # instance's stale A/P rather than silently producing wrong numbers ----
+            owner = QP._codegen_singleton_owner.get(self.codegen_module)
+            if owner != self._instance_id:
+                raise RuntimeError(
+                    f"backend='osqp_codegen' singleton conflict on module "
+                    f"'{self.codegen_module}': this QP instance's A/P are no longer current "
+                    "in the compiled solver -- another QP instance sharing the same compiled "
+                    "module pushed to it more recently. Only one backend='osqp_codegen' "
+                    "instance may be actively solved at a time without an intervening "
+                    "update_dynamics() call on it (see the QP class docstring)."
+                )
 
             # ---- solve & normalize result ----
             t0 = time.perf_counter()
@@ -469,7 +564,7 @@ class QP(OCP):
                 ok = (status_val in (1, 2)) and (x is not None) and (y is not None)
 
             if ok:
-                cost = float(x @ (self.P_mat_csc @ x) + qv @ x)
+                cost = float(x @ (self.P_mat_csc @ x) + self._qv_buf @ x)
                 sol = {'x': x, 'lam_a': y, 'cost': cost, 'success': True, 'time_ms': time_qp}
                 ret = self._pack_solution(sol, self.m.nx, self.m.nu, self.N, self.m.ni_f)
                 if self.export_standard_qp and ret.get('success', True):
@@ -547,50 +642,43 @@ class QP(OCP):
             )
             self._osqp_prob = prob
         elif self.backend == "osqp_codegen":
-            # If CSC pattern/order no longer matches codegen, fall back to native OSQP
-            try:
-                P_ut = sp.triu(2 * self.P_mat_csc, format='csc')
-                P_ut.sort_indices()
-                A_osqp = self.A_mat_csc_osqp
-                A_osqp.sort_indices()
-                self._assert_same_csc_pattern(P_ut, getattr(self, "_P_cg_sig", None), "P_ut")
-                self._assert_same_csc_pattern(A_osqp, getattr(self, "_A_cg_sig", None), "A_osqp")
-            except Exception as err:
-                if self.verbose:
-                    print("QP(osqp_codegen): pattern mismatch detected; details below:")
-                    print(str(err))
-                    print("Falling back to native OSQP backend.")
-                self.backend = "osqp"
-                prob = osqp.OSQP()
-                prob.setup(
-                    P=2 * self.P_mat_csc,
-                    q=np.zeros(self.P_mat_csc.shape[0]),
-                    A=self.A_mat_csc_osqp,
-                    l=self.lbg_osqp_base,
-                    u=self.ubg_osqp_base,
-                    polishing=True, warm_starting=False, verbose=False
+            # P never changes (pushed once at setup); only A changed here. The sparsity
+            # pattern is fixed by construction (see _compute_A_update_indices) so there's
+            # nothing to re-verify at runtime -- a genuine shape/pattern mismatch (e.g. a
+            # stale compiled solver built for a different N) is still caught below via the
+            # C API's own nonzero return code.
+            cg = self._osqp_prob
+            Ax = np.ascontiguousarray(self.A_mat_csc_osqp.data, dtype=np.float64)
+            pushed = cg.update_data_mat(A_x=Ax)
+            if pushed != 0:
+                raise RuntimeError(
+                    f"update_data_mat(A_x=...) failed with code {pushed}. This means the "
+                    "compiled solver in build/osqp_fast was codegen'd for a different horizon "
+                    "N (or different dynamics/constraints) than the one you're running now. "
+                    "Rebuild it to match: `rnmpc build-fast <system> --N <k>` (note: "
+                    "`--smoke-test` runs use N=3, not the default N=15 - pass `--smoke-test` to "
+                    "build-fast too, or `--N 3` explicitly). Or run with `--stock-osqp` to "
+                    "sidestep the compiled solver."
                 )
-                self._osqp_prob = prob
+            QP._codegen_singleton_owner[self.codegen_module] = self._instance_id
         else:
             # casadi_osqp uses CasADi sparsity; nothing to do here (handled at solve())
             pass
 
     def update_ubg(self, new_ubg):
         self.ubg = new_ubg
+        ubg_flat = np.asarray(self.ubg, dtype=np.float64).ravel()
+        self.ubg_osqp_base[:ubg_flat.size] = ubg_flat
 
-        self.ubg_osqp_base = np.concatenate([np.array(self.ubg).astype(float).ravel(),
-                                             np.zeros(self.m.nx)])
     def reset_ubg(self):
         self.ubg = self.nominal_ubg
-
-        self.ubg_osqp_base = np.concatenate([np.array(self.ubg).astype(float).ravel(),
-                                             np.zeros(self.m.nx)])
+        ubg_flat = np.asarray(self.ubg, dtype=np.float64).ravel()
+        self.ubg_osqp_base[:ubg_flat.size] = ubg_flat
 
     def reset_lbg(self):
         self.lbg = self.lbg_ZEROS_INF_NOMINAL
-
-        self.lbg_osqp_base = np.concatenate([np.array(self.lbg).astype(float).ravel(),
-                                             np.zeros(self.m.nx)])
+        lbg_flat = np.asarray(self.lbg, dtype=np.float64).ravel()
+        self.lbg_osqp_base[:lbg_flat.size] = lbg_flat
 
     def offset_constraints(self, offset_equality_constraints):
         """
@@ -668,34 +756,14 @@ class QP(OCP):
 
         return info
 
-    def _cg_push_updates(self, cg, Px, Ax, qv, l, u):
+    def _cg_push_updates(self, cg, qv, l, u):
+        """Push q, l, u to the codegen module. A (data-only) is pushed separately in
+        update_dynamics() only when it actually changes; P is pushed once at setup
+        (_init_backend) since Q/R/Qf never change for the life of the instance.
         """
-        Push P (upper-tri data), A (data), and vectors q,l,u to the codegen module,
-        """
-
-        # -------- matrices: P then A --------
-        # Use explicit kwargs so our 2 arrays are mapped to the correct slots
-        pushed_AP = cg.update_data_mat(P_x=Px, A_x=Ax)
-        # todo: only update the diagonal values ... (leverage sparsity)
-
-        # -------- vectors: q, l, u --------
-        pushed_ulq = cg.update_data_vec(qv, l, u)
-
-        # Return code 0 means success in OSQP C API
-        if pushed_AP != 0:
-            # Enrich error with pattern diagnostics if available
-            diag = {}
-            if hasattr(self, "_P_cg_sig") and hasattr(self, "_A_cg_sig"):
-                try:
-                    P_ut = sp.triu(2 * self.P_mat_csc, format='csc'); P_ut.sort_indices()
-                    A_osqp = self.A_mat_csc_osqp; A_osqp.sort_indices()
-                    diag["P"] = self._csc_diff_report(P_ut, self._P_cg_sig, "P_ut")
-                    diag["A"] = self._csc_diff_report(A_osqp, self._A_cg_sig, "A_osqp")
-                except Exception as e:
-                    diag["error"] = f"diag collection failed: {e}"
-            raise RuntimeError(f"update_data_mat failed with code {pushed_AP}. diag={diag}")
-        if pushed_ulq != 0:
-            raise RuntimeError(f"update_data_vec failed with code {pushed_ulq}")
+        pushed = cg.update_data_vec(qv, l, u)
+        if pushed != 0:
+            raise RuntimeError(f"update_data_vec failed with code {pushed}")
 
     def _store_cg_signatures(self, P_ut: sp.csc_matrix, A_osqp: sp.csc_matrix):
         # Both must be sorted before storing
@@ -793,7 +861,7 @@ class QP(OCP):
         out = Path(out_dir)
         # nuke existing folder to avoid copytree errors (simplest + robust)
         if out.exists():
-            shutil.rmtree(out)
+            shutil.rmtree(out, onerror=_clear_readonly_and_retry)
         out.mkdir(parents=True, exist_ok=True)
         self.P_mat_csc.sort_indices()
         self.A_mat_csc_osqp.sort_indices()
@@ -810,7 +878,11 @@ class QP(OCP):
         P_ut.sort_indices()
 
         prob = osqp.OSQP()
-        prob.setup(P=P_ut, q=q, A=self.A_mat_csc_osqp, l=l, u=u, polish=True, warm_start=True, verbose=False)
+        # Tight tolerances are baked into the generated C at codegen time. Default OSQP eps is
+        # ~1e-3; we tighten to 1e-6 (+ polish) so the compiled solver matches a general-purpose
+        # solver (Clarabel) to ~1e-5, and matches the stock backend used elsewhere.
+        prob.setup(P=P_ut, q=q, A=self.A_mat_csc_osqp, l=l, u=u,
+                   eps_abs=1e-6, eps_rel=1e-6, polish=True, warm_start=True, verbose=False)
         # prob.setup(
         #     P=2 * self.P_mat_csc,  # match CasADi’s h = 2*H
         #     q=np.zeros(self.P_mat_csc.shape[0]),

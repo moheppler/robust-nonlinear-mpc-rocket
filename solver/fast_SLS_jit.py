@@ -11,28 +11,9 @@ import sys, glob, importlib.util
 import time
 from prettytable import PrettyTable, NONE, HEADER
 
-# compute absolute path: <repo_root>/build/osqp_fast
-# this assumes your fast_sls file is in <repo_root>/solver/...
-codegen_dir = (Path(__file__).resolve().parents[1] / "build" / "osqp_fast")
-
-# 1) try adding the folder to sys.path
-if codegen_dir.is_dir():
-    sys.path.insert(0, str(codegen_dir))
-
-try:
-    import osqp_generated
-except ModuleNotFoundError:
-    # 2) fallback: load the compiled extension directly
-    matches = (
-        glob.glob(str(codegen_dir / "osqp_generated*.so"))
-        + glob.glob(str(codegen_dir / "osqp_generated*.pyd"))
-    )
-    if not matches:
-        raise  # extension not built / wrong folder
-    spec = importlib.util.spec_from_file_location("osqp_generated", matches[0])
-    osqp_generated = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(osqp_generated)
+# Backend selection (compiled `osqp_generated` when available, else stock `osqp`) lives in
+# solver.osqp_backend so nothing here requires a C compiler just to import this module.
+from solver.osqp_backend import select_backend, announce_backend_once
 
 PRIMAL_INFEASIBILITY = 0.0
 fastmath = False
@@ -206,9 +187,12 @@ class fast_SLS(OCP):
         self.MAX_ITER = 30
         self.nominal_solver_options = {'printLevel': 'none'}
         self.verbose = True
-        # configurable indentation for all console prints
-        tab_indent = 25
-        self._tab = "\t" * max(0, int(tab_indent))
+        # When wrapped by SCP_SLS, these get set (before each outer iteration) so this
+        # object's table rows are appended into the SAME table SCP_SLS owns/prints, instead
+        # of this object printing its own separate table. None (the default) means
+        # "standalone" -- print my own un-nested table, as when fast_SLS is used directly.
+        self._external_table = None
+        self._external_group_label = None
 
         # RTI-like iteration cap (None or <=0 disables; >0 runs exactly that many iterations)
         self.rti_steps = None
@@ -225,11 +209,13 @@ class fast_SLS(OCP):
         }
         self.convergence_data = {}
 
-        # Use compiled solver
+        # Fast compiled solver by default; transparently fall back to stock OSQP.
+        _backend = select_backend()
+        announce_backend_once(_backend)
         self.solver_forward = QP(
             self.N, self.Q, self.R, self.m, self.Qf,
-            backend="osqp",
-            codegen_module="osqp_generated"  # matches the module you just built
+            backend=_backend,
+            codegen_module="osqp_generated",
         )
         self.nominal_lbg = self.solver_forward.lbg
 
@@ -328,14 +314,14 @@ class fast_SLS(OCP):
 
     def _finish_success(self, i):
         if self.verbose:
-            print(f"{self._tab}Fast-SLS: Converged in {i} iterations")
+            print(f"Fast-SLS: Converged in {i} iterations")
         return self.post_processing_solution()
 
     def _finish_failure(self, i, infeasible=False):
         self.current_iteration['success'] = False
         if self.verbose:
             msg = "infeasible forward solve" if infeasible else f"did not converge in {i} iters"
-            print(f"{self._tab}Fast‑SLS: {msg}")
+            print(f"Fast-SLS: {msg}")
         sol = self.post_processing_solution()
         self.reset_solver_to_zeros()
         return sol
@@ -344,6 +330,10 @@ class fast_SLS(OCP):
     # Table utilities (prettytable) – mirrored from fast_SLS
     # -----------------------------
     def printHeader(self):
+        if self._external_table is not None:
+            # SCP_SLS already printed the shared header; nothing to print here.
+            return self._external_table
+
         fixed_width = 10
         headers = [
             "it (SLS)", "primal", "dual", "cost nom.", "cost tube", "cost",
@@ -355,15 +345,11 @@ class fast_SLS(OCP):
         table.hrules = HEADER
         table.border = True
 
-        # align and width
-        table.align[headers[0]] = "right"
-        for h in headers[1:]:
-            table.align[h] = "right"
         for h in headers:
+            table.align[h] = "right"
             table.max_width[h] = fixed_width
 
-        header_str = table.get_string(end=0)
-        print("\n".join(f"{self._tab}" + line for line in header_str.splitlines()))
+        print(table.get_string(end=0))
         table.hrules = NONE
         return table
 
@@ -374,7 +360,6 @@ class fast_SLS(OCP):
             primal = float(np.max(np.abs(self.current_iteration.get('primal_vec', np.array([np.nan])))))
         except Exception:
             primal = np.nan
-            # prefer eta if available; else dual_vec
         try:
             if 'eta' in self.current_iteration and self.current_iteration['eta'] is not None:
                 dual_val = float(np.max(np.abs(np.nan_to_num(self.current_iteration['eta']))))
@@ -385,9 +370,31 @@ class fast_SLS(OCP):
         cost_nom = float(self.current_iteration.get('cost_nominal', np.nan))
         cost_tube = float(self.current_iteration.get('cost_tube', np.nan))
         cost_tot = float(self.current_iteration.get('cost', np.nan))
+
+        if self._external_table is not None:
+            # Nested under SCP_SLS's merged table: fill the SLS columns, leave the SCP-only
+            # columns blank ("-"), and stamp the SCP outer-iteration number only on this
+            # group's first row (later rows leave it blank -- a visual grouping cue).
+            group_label = f"{self._external_group_label:>{fixed_width}}" if i == 0 else f"{'':>{fixed_width}}"
+            row = [
+                group_label,
+                f"{i:>{fixed_width}}",
+                f"{primal:>{fixed_width}.2e}",
+                f"{dual_val:>{fixed_width}.2e}",
+                f"{cost_nom:>{fixed_width}.2e}",
+                f"{cost_tube:>{fixed_width}.2e}",
+                f"{cost_tot:>{fixed_width}.2e}",
+                f"{'-':>{fixed_width}}",
+                f"{'-':>{fixed_width}}",
+                f"{'-':>{fixed_width}}",
+                f"{'-':>{fixed_width}}",
+            ]
+            table.add_row(row)
+            print(table.get_string(start=len(table._rows) - 1, end=len(table._rows), header=False))
+            return
+
         t_qp = self.current_iteration.get('t_qp_ms', np.nan)
         t_bwd = self.current_iteration.get('t_backward_ms', np.nan)
-
         row = [
             f"{i:>{fixed_width}}",
             f"{primal:>{fixed_width}.2e}",
@@ -399,8 +406,7 @@ class fast_SLS(OCP):
             f"{t_bwd:>{fixed_width}.2e}",
         ]
         table.add_row(row)
-        row_str = table.get_string(start=len(table._rows) - 1, end=len(table._rows), header=False)
-        print("\n".join(f"{self._tab}" + line for line in row_str.splitlines()))
+        print(table.get_string(start=len(table._rows) - 1, end=len(table._rows), header=False))
 
     # -----------------------------
     # Minimal state init/reset
@@ -460,7 +466,7 @@ class fast_SLS(OCP):
         sol = self.solver_forward.solve(x0)
         if sol['success'] is False:
             if self.verbose:
-                print(f"{self._tab}Infeasible forward solution. Try another initial condition.")
+                print("Infeasible forward solution. Try another initial condition.")
             return False
         self.current_iteration['t_qp_ms'] = sol.get('time_ms', np.nan)
         self.current_iteration['primal_vec'] = sol['primal_vec']
@@ -493,8 +499,11 @@ class fast_SLS(OCP):
         # Ensure contiguous float64 arrays (Numba likes this)
         A = np.ascontiguousarray(np.stack(self.A_list).astype(np.float64))  # (N, nx, nx)
         B = np.ascontiguousarray(np.stack(self.B_list).astype(np.float64))  # (N, nx, nu)
-        G = np.ascontiguousarray(m.G.full().astype(np.float64))  # (p, nx+nu)
-        Gf = np.ascontiguousarray(m.Gf.full().astype(np.float64))  # (pf, nx)
+        # m.G / m.Gf may be a casadi DM (published models) or a plain numpy array (LTI
+        # fixtures); np.asarray coerces both (casadi DM via __array__), matching the
+        # np.ascontiguousarray idiom used in update_tightening below.
+        G = np.ascontiguousarray(np.asarray(m.G, dtype=np.float64))  # (p, nx+nu)
+        Gf = np.ascontiguousarray(np.asarray(m.Gf, dtype=np.float64))  # (pf, nx)
         eta = np.ascontiguousarray(self.current_iteration['eta'].astype(np.float64))  # (N, N+1, p)
         eta_f = np.ascontiguousarray(self.current_iteration['eta_f'].astype(np.float64))  # (N+1, pf)
         Q_reg = np.ascontiguousarray(self.Q_reg.astype(np.float64))  # (nx, nx)

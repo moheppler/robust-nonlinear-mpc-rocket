@@ -1,13 +1,12 @@
-from dyn.rockETH.rocket import Rocket
+from dyn.rocket import Rocket
 
 import numpy as np
 import matplotlib.pyplot as plt
 import os
 from util.footnote import add_footnote_time
-folder_name = "rockETH_robust_closed_loop"
+from util.paths import results_dir
 
-if not os.path.exists(folder_name):
-    os.makedirs(folder_name)
+_RESULT_NAME = "rockETH_robust_closed_loop"
 
 from datetime import datetime
 from matplotlib.lines import Line2D
@@ -26,11 +25,9 @@ def _tube_halfwidth_to_unit(halfw, lb, ub):
     denom = (ub - lb) if (ub - lb) != 0 else 1.0
     return 2.0 * halfw / denom
 
-# fix the random seed for reproducibility
-np.random.seed(0)
-
-def generate(N: int | None = None):
+def generate(N: int | None = None, smoke_test: bool = False):
     m = Rocket()
+    folder_name = str(results_dir(_RESULT_NAME))
     Q = np.diag([
         10.0,  # x
         10.0,  # y
@@ -60,7 +57,7 @@ def generate(N: int | None = None):
 
     Qf = 10 * Q
 
-    N = int(N) if N is not None else 15  # horizon length
+    N = 3 if smoke_test else (int(N) if N is not None else 15)  # horizon length
 
     m.dt = 0.05
     sigma_theta = np.deg2rad(2.0)  # ~0.035 rad
@@ -92,22 +89,10 @@ def generate(N: int | None = None):
     solver.fast_SLS_solver.CONV_EPS = 1e-4
     solver.epsilon_convergence = 1e-3
 
-    # pick a random initial condition within the state constraints
-    # derive bounds from m.g (first nx are state upper bounds; next nu are input ub; then state lb negated)
-    ub_x = m.g[:m.nx]
-    lb_x = -m.g[m.nx + m.nu: m.nx + m.nu + m.nx]
+    rng = np.random.default_rng(0)  # seeded for reproducibility
 
-    # uniform sample per state
-    rng = np.random.default_rng()  # for reproducibility
-    x0 = rng.uniform(lb_x/2, ub_x/2)
-
-    # overwrite quaternion (slots 6..9) with a random unit quaternion [w,x,y,z]
-    q_rand = rng.normal(size=4)
-    q_rand /= np.linalg.norm(q_rand) if np.linalg.norm(q_rand) != 0 else 1.0
-    x0[6:10] = q_rand
-
-    # final safety clamp
-    x0 =np.array([1.75729,
+    # fixed initial condition
+    x0 = np.array([1.75729,
                     4.15951,
                     4.72757,
                     -0.18913,
@@ -125,7 +110,7 @@ def generate(N: int | None = None):
                     -0.40116,
                     -0.35401])
 
-    simulation_time_steps = 30  # Define the number of time steps for the simulation
+    simulation_time_steps = 3 if smoke_test else 30  # Define the number of time steps for the simulation
     # Initialize the state trajectory with the initial state
     state_trajectory = np.zeros((m.nx, simulation_time_steps))
     state_trajectory[:, 0] = np.array(x0).reshape(-1)
@@ -159,7 +144,7 @@ def generate(N: int | None = None):
         t_jac[i] = tj
         t_qp[i] = tq
         t_riccati[i] = tb
-        print(f"[Rocket]   -> done (Δt: jac={solution.get('t_jac_ms', 0.0):.2f} ms, qp={solution.get('t_qp_ms', 0.0):.2f} ms, riccati={solution.get('t_backward_ms', 0.0):.2f} ms)")
+        print(f"[Rocket]   -> done (dt: jac={solution.get('t_jac_ms', 0.0):.2f} ms, qp={solution.get('t_qp_ms', 0.0):.2f} ms, riccati={solution.get('t_backward_ms', 0.0):.2f} ms)")
         # Store the backoff trajectories
         backoff_trajectory_x[:, :, i] = solution['backoff_x'].T
         backoff_trajectory_u[:, :, i] = solution['backoff_u'].T
@@ -175,11 +160,8 @@ def generate(N: int | None = None):
 
         # Update the initial state for the next iteration
         # create perturbation for the vertical speed
-        w = np.zeros(m.nx)
-        #w[5] = 2 * np.random.rand(1) -1  # add noise to vz
-        w = 2 * np.random.rand(m.nx) - 1  # add noise to vz
-
-        x0 = m.ddyn(x0, solution['primal_u'][:, 0]) + m.E@ w
+        w = rng.uniform(-1.0, 1.0, size=m.nx)  # seeded disturbance realization
+        x0 = m.ddyn(x0, solution['primal_u'][:, 0]) + m.E @ w
 
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -206,6 +188,7 @@ def generate(N: int | None = None):
     )
 
     print(f"Results saved to {filename}")
+    return filename
 
 
 def plot():
@@ -215,6 +198,7 @@ def plot():
     from matplotlib.lines import Line2D
     from matplotlib.patches import Polygon
     import matplotlib.colors as mcolors
+    folder_name = str(results_dir(_RESULT_NAME))
     files = [f for f in os.listdir(folder_name) if f.endswith('.npz')]
 
     if not files:
@@ -450,7 +434,7 @@ def plot():
     axs[5].set_xlabel("Time [s]")
 
     plt.tight_layout(pad=1.5)
-    plt.savefig("rockETH_robust_closed_loop/trajectory_plot_closed_loop.pdf", format="pdf", dpi=600, bbox_inches="tight")
+    plt.savefig(os.path.join(folder_name, "trajectory_plot_closed_loop.pdf"), format="pdf", dpi=600, bbox_inches="tight")
     plt.show()
 
 
@@ -458,9 +442,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Rocket robust closed-loop experiment")
     parser.add_argument('--run', action='store_true', help='Run the closed-loop simulation (generate data)')
     parser.add_argument('--N', type=int, default=None, help='Horizon length (overrides default if provided)')
+    parser.add_argument('--smoke-test', action='store_true',
+                        help='Run a short, cheap variant to validate the pipeline end-to-end.')
     args = parser.parse_args()
 
     if args.run:
-        generate(args.N)
+        generate(args.N, smoke_test=args.smoke_test)
     else:
         plot()

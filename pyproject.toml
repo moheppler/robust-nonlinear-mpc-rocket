@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robust-nonlinear-mpc"
+version = "1.0.0"
+description = "Guaranteed robust nonlinear MPC via System Level Synthesis (SLS) tube MPC — paper companion code."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "numpy>=2.2,<3",
+    "scipy>=1.16,<2",
+    "casadi>=3.7,<4",
+    "matplotlib>=3.10,<4",
+    "numba>=0.61,<0.62",
+    "osqp>=1.0,<2",
+    "prettytable>=3.16,<4",
+]
+
+[project.optional-dependencies]
+# cvxpy pulls in Clarabel (BSD), the open general-purpose solver used by the equivalence
+# oracles in tests/oracles/ (replaces MOSEK). Runtime deps above are unaffected.
+dev = ["pytest>=8,<9", "cvxpy>=1.5,<2"]
+
+[project.scripts]
+rnmpc = "rnmpc_cli:main"
+
+[tool.setuptools]
+py-modules = ["rnmpc_cli"]
+packages = ["dyn", "solver", "util", "expe", "tests", "tests.fixtures", "tests.oracles"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]

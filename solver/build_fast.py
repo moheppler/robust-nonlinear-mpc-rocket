@@ -45,7 +45,8 @@ def _make_model(system: str):
     return m
 
 
-def codegen(system: str, N: int | None = None, smoke_test: bool = False) -> Path:
+def codegen(system: str, N: int | None = None, smoke_test: bool = False,
+            model: "RocketDirect | Rocket | Quadrotor | Pendulum | None" = None) -> Path:
     if system not in SYSTEM_MODELS:
         raise ValueError(f"unknown system {system!r}; choose from {sorted(SYSTEM_MODELS)}")
     # Must match each expe/main_<system>.py's generate(): smoke_test always uses N=3,
@@ -53,7 +54,7 @@ def codegen(system: str, N: int | None = None, smoke_test: bool = False) -> Path
     # solve time (qp_jit.py's CSC-pattern check) rather than silently, but it's cheaper
     # to just keep this in sync.
     N = 3 if smoke_test else (15 if N is None else int(N))
-    m = _make_model(system)
+    m = model if model is not None else _make_model(system)
     Q = np.eye(m.nx)
     R = np.eye(m.nu)
     Qf = 10 * np.eye(m.nx)
@@ -106,8 +107,9 @@ class FastSolverBuildError(RuntimeError):
     """Raised when compiling the codegen'd OSQP extension fails."""
 
 
-def build(system: str, N: int | None = None, smoke_test: bool = False) -> None:
-    out = codegen(system, N=N, smoke_test=smoke_test)
+def build(system: str, N: int | None = None, smoke_test: bool = False,
+          model: "RocketDirect | Rocket | Quadrotor | Pendulum | None" = None) -> None:
+    out = codegen(system, N=N, smoke_test=smoke_test, model=model)
     print(f"[rnmpc] Wrote codegen sources to {out}")
     print(f"[rnmpc] Building + installing the fast solver for {system} (needs a C compiler + CMake) ...")
     result = subprocess.run(

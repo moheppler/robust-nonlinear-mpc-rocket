@@ -142,7 +142,11 @@ RNMPC_FAST_TESTS=1 pytest tests/test_backend_equivalence.py -q
 ## Repository layout
 
 - `dyn/` — the dynamical models (`pendulum.py`, `quadrotor.py`, `rocket.py`) and the shared
-  `Model` / `LTI` / `LTV` base classes. The core ODEs live here.
+  `Model` / `LTI` / `LTV` base classes. The core ODEs live here. `ddyn(x, u)` integrates with
+  the model's own `self.dt` (most models define 50 ms in their constructor) and is free of side
+  effects — it no longer overwrites `model.dt`; models can set their own step (e.g. the reduced
+  `RocketDirect` uses 25 Hz) and every solver component (Jacobians, nominal NLP, tube checks)
+  uses it consistently.
 - `solver/` — the SLS tube-MPC solver: SCP outer loop (`SCP_SLS_jit.py`), the fast inner
   Riccati/tube solver (`fast_SLS_jit.py`), and the QP front-end (`qp_jit.py`).
 - `expe/` — the closed-loop experiment scripts, one per system.

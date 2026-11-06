@@ -76,7 +76,7 @@ class RocketDirect(Model):
 
         self.nx = len(self.state)
         self.nu = len(self.control)
-        self.dt = 1.0 / 25.0  # 30 Hz controller rate
+        self.dt = 1.0 / 25.0  # 25 Hz controller rate
 
         # --- Bounds (monitor-style, matching the original Rocket layout) ---
         # quaternion uses the same +/-1.5 bound as the original; body rates use

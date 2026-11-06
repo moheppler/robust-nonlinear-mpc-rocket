@@ -1,6 +1,11 @@
 import numpy as np
 
 
+# Default one-step discretization time [s], used when a model does not define
+# its own `self.dt`.
+DEFAULT_DT = 0.05
+
+
 class Model:
     def __init__(self):
         self.dt = None
@@ -12,9 +17,18 @@ class Model:
         self.ode = None
         self.discretization_method = 'rk4'  # Default to RK4, can be set to 'euler'
 
-    def ddyn(self, x, u, h=.05):
+    def ddyn(self, x, u, h=None):
+        """One-step discretized dynamics: RK4 (default) or Euler over `t.
+
+        `h` defaults to the model's own `self.dt` (most models define it in
+        their constructor); passing `h` explicitly is equivalent. `self.dt`
+        is NOT modified by a call (calls are side-effect free).
+        """
         ode = self.ode
-        self.dt = h
+        if h is None:
+            h = self.dt if self.dt is not None else DEFAULT_DT
+        else:
+            h = float(h)
 
         # Default to RK4 if discretization_method is not set
         discretization_method = getattr(self, 'discretization_method', 'rk4')

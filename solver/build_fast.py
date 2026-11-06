@@ -15,6 +15,7 @@ from dyn.LTV import LTV
 from dyn.pendulum import Pendulum
 from dyn.quadrotor import Quadrotor
 from dyn.rocket import Rocket
+from dyn.rocket_direct import RocketDirect
 from solver.osqp_backend import CODEGEN_DIR
 from solver.qp_jit import QP
 
@@ -25,6 +26,7 @@ SYSTEM_MODELS = {
     "quadrotor": Quadrotor,
     "rocket": Rocket,
     "rocket-compare": Rocket,
+    "rocket-direct": RocketDirect,
 }
 
 

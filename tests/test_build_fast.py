@@ -4,7 +4,7 @@ import solver.build_fast as bf
 
 
 def test_system_models_registry():
-    assert set(bf.SYSTEM_MODELS) == {"pendulum", "quadrotor", "rocket", "rocket-compare"}
+    assert set(bf.SYSTEM_MODELS) == {"pendulum", "quadrotor", "rocket", "rocket-compare", "rocket-direct"}
 
 
 def test_codegen_writes_absolute_build_dir(tmp_path, monkeypatch):

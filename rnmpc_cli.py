@@ -17,6 +17,7 @@ SYSTEMS = {
     "quadrotor": "expe.main_quadrotor_robust_closed_loop",
     "rocket": "expe.main_rocket_robust_closed_loop",
     "rocket-compare": "expe.main_rocket_compare_closed_loop",
+    "rocket-direct": "expe.main_rocket_direct_closed_loop",
 }
 
 

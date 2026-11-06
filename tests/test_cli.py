@@ -4,7 +4,7 @@ import rnmpc_cli
 
 
 def test_systems_registry_complete():
-    assert set(rnmpc_cli.SYSTEMS) == {"pendulum", "quadrotor", "rocket", "rocket-compare"}
+    assert set(rnmpc_cli.SYSTEMS) == {"pendulum", "quadrotor", "rocket", "rocket-compare", "rocket-direct"}
 
 
 def test_help_exits_zero(capsys):
